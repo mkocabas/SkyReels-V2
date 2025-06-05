@@ -35,6 +35,14 @@ class VideoTextDataset(torch.utils.data.Dataset):
                 json_path = path.replace('/mp4', '/captions').replace('.mp4', '.json')
                 if not os.path.exists(json_path):
                     non_existing_paths.append(path)
+                else:
+                    # check if the json file is valid
+                    try:
+                        json.load(open(json_path))
+                    except Exception as e:
+                        non_existing_paths.append(path)
+                        print(f'{json_path} is not valid: {e}')
+                
             self.video_paths = non_existing_paths
             print(f'{len(non_existing_paths)} videos remain')
                 

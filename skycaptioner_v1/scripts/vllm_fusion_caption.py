@@ -87,11 +87,26 @@ class StructuralCaptionDataset(torch.utils.data.Dataset):
             non_existing_paths = []
             for path in self.video_paths:
                 json_path = path.replace('/mp4', '/captions').replace('.mp4', f'_{self.task}.json')
+                inp_json_path = path.replace('/mp4', '/captions').replace('.mp4', '.json')
                 if not os.path.exists(json_path):
+                    try:
+                        json.load(open(inp_json_path))
+                    except Exception as e:
+                        print(f'{inp_json_path} is not valid: {e}')
+                        continue
+                    
                     non_existing_paths.append(path)
+                else:
+                    # check if the json file is valid skip it
+                    try:
+                        json.load(open(json_path))
+                    except Exception as e:
+                        print(f'{json_path} is not valid: {e}')
+                        continue
+                
             self.video_paths = non_existing_paths
             print(f'{len(non_existing_paths)} videos remain')
-                
+            
         print(f'{len(self.video_paths)} videos remain')
 
         self.system_prompt = SYSTEM_PROMPT_T2V if self.task == 't2v' else SYSTEM_PROMPT_I2V
@@ -106,8 +121,11 @@ class StructuralCaptionDataset(torch.utils.data.Dataset):
         # real_index = self.meta.index[index]
         video_path = self.video_paths[index]
         struct_caption_path = video_path.replace('/mp4', '/captions').replace('.mp4', '.json')
-        
-        struct_caption = json.load(open(struct_caption_path))
+        try:
+            struct_caption = json.load(open(struct_caption_path))
+        except Exception as e:
+            print(f'{struct_caption_path} is not valid: {e}')
+            return None
 
         camera_movement = struct_caption.get('camera_motion', '')
         if camera_movement != '':
@@ -204,6 +222,7 @@ class StructuralCaptionDataset(torch.utils.data.Dataset):
         return new_struct_caption
 
 def custom_collate_fn(batch):
+    batch = [item for item in batch if item is not None]
     real_indices, fusion_by_llm, texts, original_texts, camera_movements = zip(*batch)
     return list(real_indices), list(fusion_by_llm), list(texts), list(original_texts), list(camera_movements)
 
@@ -219,21 +238,8 @@ if __name__ == "__main__":
     parser.add_argument("--end_idx", type=int, default=-1)
     
     args = parser.parse_args()
-
-    sampling_params = SamplingParams(
-        temperature=0.1,
-        max_tokens=512,
-        stop=['\n\n']
-    )
-    # model_path = "/maindata/data/shared/public/Common-Models/Qwen2.5-32B-Instruct/"
-
-    llm = LLM(
-        model=args.model_path,
-        gpu_memory_utilization=0.9,
-        max_model_len=4096,
-        tensor_parallel_size = args.tp
-    )
     
+    pprint(args)
 
     dataset = StructuralCaptionDataset(
         input_txt=args.input_txt, 
@@ -251,6 +257,24 @@ if __name__ == "__main__":
         shuffle=False,
         drop_last=False,
     )
+    
+    import ipdb; ipdb.set_trace()
+    
+    sampling_params = SamplingParams(
+        temperature=0.1,
+        max_tokens=512,
+        stop=['\n\n']
+    )
+    # model_path = "/maindata/data/shared/public/Common-Models/Qwen2.5-32B-Instruct/"
+
+    llm = LLM(
+        model=args.model_path,
+        gpu_memory_utilization=0.9,
+        max_model_len=4096,
+        tensor_parallel_size = args.tp
+    )
+    
+    
 
     for sc_paths, fusion_by_llms, texts, original_texts, camera_movements in tqdm(dataloader):
         sc_paths_, llm_texts, llm_original_texts, llm_camera_movements = [], [], [], []
