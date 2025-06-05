@@ -4,6 +4,8 @@ checkpoint
 results/*
 .DS_Store
 results/*
+skycaptioner_v1/models/
+skycaptioner_v1/logs/
 *.png
 *.jpg
 *.mp4

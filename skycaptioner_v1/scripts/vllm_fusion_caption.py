@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import argparse
 import glob
+from pprint import pprint
 import time
 import gc
 from tqdm import tqdm
@@ -12,7 +13,8 @@ from vllm import LLM, SamplingParams
 from torch.utils.data import DataLoader
 import json
 import random
-from utils import result_writer
+import numpy as np
+
 
 SYSTEM_PROMPT_I2V = """
 You are an expert in video captioning. You are given a structured video caption and you need to compose it to be more natural and fluent in English.
@@ -23,7 +25,6 @@ You are an expert in video captioning. You are given a structured video caption 
 ## Notes
 1. If there has an empty field, just ignore it and do not mention it in the output.
 2. Do not make any semantic changes to the original fields. Please be sure to follow the original meaning.
-3. If the action field is not empty, eliminate the irrelevant information in the action field that is not related to the timing action(such as wearings, background and environment information) to make a pure action field.
 
 ## Output Principles and Orders
 1. First, eliminate the static information in the action field that is not related to the timing action, such as background or environment information.
@@ -54,6 +55,7 @@ You are an expert in video captioning. You are given a structured video caption 
 Please directly output the final composed caption without any additional information.
 """
 
+
 SHOT_TYPE_LIST = [
     'close-up shot',
     'extreme close-up shot',
@@ -64,27 +66,48 @@ SHOT_TYPE_LIST = [
 
 
 class StructuralCaptionDataset(torch.utils.data.Dataset):
-    def __init__(self, input_csv, model_path, task=None):
-        if isinstance(input_csv, pd.DataFrame):
-            self.meta = input_csv
-        else:
-            self.meta = pd.read_csv(input_csv)
+    def __init__(self, input_txt, model_path, task=None, start_idx=0, end_idx=-1, filter_existing=True):
+        
+        self.video_paths = sorted(np.loadtxt(input_txt, dtype=str))
+        if end_idx == -1:
+            end_idx = len(self.video_paths)
+            
+        if end_idx > len(self.video_paths):
+            print(f'end_idx {end_idx} is greater than the number of videos {len(self.video_paths)}')
+            end_idx = len(self.video_paths)
+            
+        self.video_paths = self.video_paths[start_idx:end_idx]
+        
         if task is None:
             self.task = args.task
         else:
             self.task = task
+            
+        if filter_existing:
+            non_existing_paths = []
+            for path in self.video_paths:
+                json_path = path.replace('/mp4', '/captions').replace('.mp4', f'_{self.task}.json')
+                if not os.path.exists(json_path):
+                    non_existing_paths.append(path)
+            self.video_paths = non_existing_paths
+            print(f'{len(non_existing_paths)} videos remain')
+                
+        print(f'{len(self.video_paths)} videos remain')
+
         self.system_prompt = SYSTEM_PROMPT_T2V if self.task == 't2v' else SYSTEM_PROMPT_I2V
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         
     
     def __len__(self):
-        return len(self.meta)
+        return len(self.video_paths)
     
     def __getitem__(self, index):
-        row = self.meta.iloc[index]
-        real_index = self.meta.index[index]
-
-        struct_caption = json.loads(row["structural_caption"])
+        # row = self.meta.iloc[index]
+        # real_index = self.meta.index[index]
+        video_path = self.video_paths[index]
+        struct_caption_path = video_path.replace('/mp4', '/captions').replace('.mp4', '.json')
+        
+        struct_caption = json.load(open(struct_caption_path))
 
         camera_movement = struct_caption.get('camera_motion', '')
         if camera_movement != '':
@@ -109,7 +132,7 @@ class StructuralCaptionDataset(torch.utils.data.Dataset):
             fusion_by_llm = True
         else:
             text = '-'
-        return real_index, fusion_by_llm, text, '-', camera_movement
+        return struct_caption_path, fusion_by_llm, text, '-', camera_movement
     
     def clean_struct_caption(self, struct_caption, task):
         raw_subjects = struct_caption.get('subjects', [])
@@ -127,6 +150,12 @@ class StructuralCaptionDataset(torch.utils.data.Dataset):
                 del subject['TYPES']
             if 'is_main_subject' in subject:
                 del subject['is_main_subject']
+            
+            # remove action and expression for human subjects since we condition with pose
+            if subject_type == 'Human':
+                subject['action'] = ''
+                subject['expression'] = ''
+                
             subjects.append(subject)
 
         to_del_subject_ids = []
@@ -181,12 +210,13 @@ def custom_collate_fn(batch):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Caption Fusion by LLM")
-    parser.add_argument("--input_csv", default="./examples/test_result.csv")
-    parser.add_argument("--out_csv", default="./examples/test_result_caption.csv")
+    parser.add_argument("--input_txt", default="./examples/test_result.csv")
     parser.add_argument("--bs", type=int, default=4)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--model_path", required=True, type=str, help="LLM model path")
-    parser.add_argument("--task", default='t2v', help="t2v or i2v")
+    parser.add_argument("--task", default='t2v', help="t2v or i2v", choices=['t2v', 'i2v'])
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--end_idx", type=int, default=-1)
     
     args = parser.parse_args()
 
@@ -197,7 +227,6 @@ if __name__ == "__main__":
     )
     # model_path = "/maindata/data/shared/public/Common-Models/Qwen2.5-32B-Instruct/"
 
-   
     llm = LLM(
         model=args.model_path,
         gpu_memory_utilization=0.9,
@@ -206,7 +235,13 @@ if __name__ == "__main__":
     )
     
 
-    dataset = StructuralCaptionDataset(input_csv=args.input_csv, model_path=args.model_path)
+    dataset = StructuralCaptionDataset(
+        input_txt=args.input_txt, 
+        model_path=args.model_path,
+        task=args.task,
+        start_idx=args.start_idx,
+        end_idx=args.end_idx,
+    )
     
     dataloader = DataLoader(
         dataset,
@@ -217,20 +252,19 @@ if __name__ == "__main__":
         drop_last=False,
     )
 
-    indices_list = []
-    result_list = []
-    for indices, fusion_by_llms, texts, original_texts, camera_movements in tqdm(dataloader):
-        llm_indices, llm_texts, llm_original_texts, llm_camera_movements = [], [], [], []
-        for idx, fusion_by_llm, text, original_text, camera_movement in zip(indices, fusion_by_llms, texts, original_texts, camera_movements):
+    for sc_paths, fusion_by_llms, texts, original_texts, camera_movements in tqdm(dataloader):
+        sc_paths_, llm_texts, llm_original_texts, llm_camera_movements = [], [], [], []
+        for sc_path, fusion_by_llm, text, original_text, camera_movement in zip(sc_paths, fusion_by_llms, texts, original_texts, camera_movements):
             if fusion_by_llm:
-                llm_indices.append(idx)
+                sc_paths_.append(sc_path)
                 llm_texts.append(text)
                 llm_original_texts.append(original_text)
                 llm_camera_movements.append(camera_movement)    
             else:
-                indices_list.append(idx)
                 caption = original_text + " " + camera_movement
-                result_list.append(caption)
+                with open(sc_path.replace('.json', f'_{args.task}.json'), 'w') as f:
+                    json.dump(caption, f)
+        
         if len(llm_texts) > 0:
             try:
                 outputs = llm.generate(llm_texts, sampling_params, use_tqdm=False)
@@ -238,19 +272,23 @@ if __name__ == "__main__":
                 for output in outputs:
                     result = output.outputs[0].text.strip()
                     results.append(result)
-                indices_list.extend(llm_indices)
             except Exception as e:
-                print(f"Error at {llm_indices}: {str(e)}")
-                indices_list.extend(llm_indices)
+                print(f"Error at {sc_paths_}: {str(e)}")
+                import ipdb; ipdb.set_trace()
                 results = llm_original_texts
             
-            for result, camera_movement in zip(results, llm_camera_movements):
+            for idx, (result, camera_movement) in enumerate(zip(results, llm_camera_movements)):
                 # concat camera movement to fusion_caption
                 llm_caption = result + " " + camera_movement
-                result_list.append(llm_caption)
+                
+                with open(sc_paths_[idx].replace('.json', f'_{args.task}.json'), 'w') as f:
+                    json.dump(llm_caption, f)
+        
+        # print(f'Processed {len(sc_paths)} videos')
+        # print(f'Saved to:')
+        # for sc_path in sc_paths:
+        #     print('\t', sc_path.replace('.json', f'_{args.task}.json'))
+        # input('Press Enter to continue...')
+                
     torch.cuda.empty_cache()
     gc.collect()
-    gathered_list = [indices_list, result_list]
-    meta_new = result_writer(indices_list, result_list, dataset.meta, column=[f"{args.task}_fusion_caption"])
-    meta_new.to_csv(args.out_csv, index=False)
-        

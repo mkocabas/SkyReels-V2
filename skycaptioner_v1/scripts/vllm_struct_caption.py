@@ -1,11 +1,13 @@
 
+import json
+import os
 import torch
 import decord
 import argparse
 
 import pandas as pd
 import numpy as np
-
+from pprint import pprint
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer, AutoProcessor
@@ -16,19 +18,34 @@ SYSTEM_PROMPT = "I need you to generate a structured and detailed caption for th
 
 
 class VideoTextDataset(torch.utils.data.Dataset):
-    def __init__(self, csv_path, model_path):
-        if isinstance(csv_path, pd.DataFrame):
-            self.meta = csv_path
-        else:
-            self.meta = pd.read_csv(csv_path)
-        self._path = 'path'
+    def __init__(self, input_txt, model_path, start_idx=0, end_idx=-1, filter_existing=True):
+        self.video_paths = np.loadtxt(input_txt, dtype=str)
+        if end_idx == -1:
+            end_idx = len(self.video_paths)
+            
+        if end_idx > len(self.video_paths):
+            print(f'end_idx {end_idx} is greater than the number of videos {len(self.video_paths)}')
+            end_idx = len(self.video_paths)
+            
+        self.video_paths = self.video_paths[start_idx:end_idx]
+        
+        if filter_existing:
+            non_existing_paths = []
+            for path in self.video_paths:
+                json_path = path.replace('/mp4', '/captions').replace('.mp4', '.json')
+                if not os.path.exists(json_path):
+                    non_existing_paths.append(path)
+            self.video_paths = non_existing_paths
+            print(f'{len(non_existing_paths)} videos remain')
+                
+        print(f'{len(self.video_paths)} videos remain')
+        
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.processor = AutoProcessor.from_pretrained(model_path)
   
-    def __getitem__(self, index):
-        row = self.meta.iloc[index]
-        path = row[self._path]
-        real_index = self.meta.index[index]
+    def __getitem__(self, index):        
+        path = self.video_paths[index]
+        
         vr = decord.VideoReader(path, ctx=decord.cpu(0), width=360, height=420)
         start = 0
         end = len(vr)
@@ -41,7 +58,7 @@ class VideoTextDataset(torch.utils.data.Dataset):
                     "content": [
                         {
                             "type": "video",
-                            "video": row['path'],
+                            "video": path,
                             "max_pixels": 360 * 420, # 460800
                             "fps": 2.0,
                         },
@@ -52,7 +69,7 @@ class VideoTextDataset(torch.utils.data.Dataset):
                     ],
                 }
                 
-        # 生成 user_input
+        # user_input
         user_input = self.processor.apply_chat_template(
             [conversation],
             tokenize=False,
@@ -63,12 +80,13 @@ class VideoTextDataset(torch.utils.data.Dataset):
             'prompt': user_input,
             'multi_modal_data': {'video': video_inputs}
         }
-        results["index"] = real_index
+        # results["index"] = real_index
         results['input'] = inputs
+        results['path'] = path
         return results
 
     def __len__(self):
-        return len(self.meta)
+        return len(self.video_paths)
 
     def get_index(self, video_size, num_frames, st=0):
         seg_size = max(0., float(video_size - 1) / num_frames)
@@ -81,23 +99,6 @@ class VideoTextDataset(torch.utils.data.Dataset):
             idx = min(start, max_frame)
             seq.append(idx+st)
         return seq
-    
-def result_writer(indices_list: list, result_list: list, meta: pd.DataFrame, column):
-    flat_indices = []
-    for x in zip(indices_list):
-        flat_indices.extend(x)
-    flat_results = []
-    for x in zip(result_list):
-        flat_results.extend(x)
-    
-    flat_indices = np.array(flat_indices)
-    flat_results = np.array(flat_results)
-
-    unique_indices, unique_indices_idx = np.unique(flat_indices, return_index=True)
-    meta.loc[unique_indices, column[0]] = flat_results[unique_indices_idx]
-
-    meta = meta.loc[unique_indices]
-    return meta
 
 
 def worker_init_fn(worker_id):
@@ -107,16 +108,21 @@ def worker_init_fn(worker_id):
     # Prevent deadlocks by setting timeout
     torch.set_num_threads(1)
 
+
 def main():
     parser = argparse.ArgumentParser(description="SkyCaptioner-V1 vllm batch inference")
-    parser.add_argument("--input_csv", default="./examples/test.csv")
-    parser.add_argument("--out_csv", default="./examples/test_result.csv")
+    parser.add_argument("--input_txt", default=None, type=str)
+    # parser.add_argument("--out_csv", default="./examples/test_result.csv")
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--end_idx", type=int, default=-1)
     parser.add_argument("--bs", type=int, default=4)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--model_path", required=True, type=str, help="skycaptioner-v1 model path")
     args = parser.parse_args()
     
-    dataset = VideoTextDataset(csv_path=args.input_csv, model_path=args.model_path)
+    pprint(args)
+    
+    dataset = VideoTextDataset(args.input_txt, model_path=args.model_path, start_idx=args.start_idx, end_idx=args.end_idx)
     dataloader = DataLoader(
         dataset,
         batch_size=args.bs,
@@ -133,10 +139,8 @@ def main():
         max_model_len=31920,
         tensor_parallel_size=args.tp)
     
-    indices_list = []
-    caption_save = []
     for video_batch in tqdm(dataloader):
-        indices = video_batch["index"]
+        # indices = video_batch["index"]
         inputs = video_batch["input"]
         batch_user_inputs = []
         for prompt, video in zip(inputs['prompt'], inputs['multi_modal_data']['video'][0]):
@@ -144,13 +148,16 @@ def main():
             batch_user_inputs.append(usi)
         outputs = llm.generate(batch_user_inputs, sampling_params, use_tqdm=False)
         struct_outputs = [output.outputs[0].text for output in outputs]
+        for sidx, sout in enumerate(struct_outputs):
+            vid_path = video_batch['path'][sidx]
+            save_path = vid_path.replace('/mp4', '/captions').replace('.mp4', '.json')
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            try:
+                with open(save_path, 'w') as f:
+                    json.dump(json.loads(sout), f)
+            except Exception as e:
+                print(f'Error saving to {save_path}: {e}')
 
-        indices_list.extend(indices.tolist())
-        caption_save.extend(struct_outputs)
-    
-    meta_new = result_writer(indices_list, caption_save, dataset.meta, column=["structural_caption"])
-    meta_new.to_csv(args.out_csv, index=False)
-    print(f'Saved structural_caption to {args.out_csv}')
 
 if __name__ == '__main__':
     main()
